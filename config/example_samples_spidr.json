@@ -1,0 +1,10 @@
+{
+    "spidr1": {
+      "R1": ["data/spidr1_R1.fastq.gz"],
+      "R2": ["data/spidr1_R2.fastq.gz"]
+    },
+    "spidr2": {
+      "R1": ["data/spidr2_R1.fastq.gz"],
+      "R2": ["data/spidr2_R2.fastq.gz"]
+    }
+}

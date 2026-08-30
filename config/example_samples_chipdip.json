@@ -1,0 +1,10 @@
+{
+    "chipdip1": {
+      "R1": ["data/chipdip1_R1.fastq.gz"],
+      "R2": ["data/chipdip1_R2.fastq.gz"]
+    },
+    "chipdip2": {
+      "R1": ["data/chipdip2_R1.fastq.gz"],
+      "R2": ["data/chipdip2_R2.fastq.gz"]
+    }
+}

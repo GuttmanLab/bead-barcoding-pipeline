@@ -1,0 +1,85 @@
+# Except for conda_env, paths in this file are specified relative to the working directory, which refers to following,
+# in order of precedence:
+# 1. the directory specified by the `--directory` command line option
+# 2. the directory specified by the `workdir:` directive in the Snakefile
+# 3. the directory in which Snakemake is invoked
+
+# Optional: name of an existing conda environment, or a path to an
+# already-built conda environment directory, to reuse for all rules instead
+# of having Snakemake build a fresh environment from workflow/envs/pipeline.yaml
+# in this working directory. Useful if you run this pipeline repeatedly across
+# many experiment directories and want to build the environment once. Unlike
+# other paths in this file, a path given here is NOT relative to the working
+# directory (see note at top of file). Set to null or "" to use the default
+# per-working-directory environment creation behavior.
+conda_env: null
+
+# Email to which errors will be sent; set to null or "" to skip emails
+email: ""
+
+# (Required) Path to barcode config file
+barcode_config: "config/example_config_splitcode_spidr.txt"
+
+# (Required) Path to barcode format file
+barcode_format: "config/example_format_splitcode_spidr.txt"
+
+# (Required) Path to samples JSON file, e.g., as produced with the fastq2json.py script
+samples: "config/example_samples_spidr.json"
+
+# (Required) Scripts directory
+scripts_dir: "workflow/scripts/"
+
+# (Optional) Output directory
+output_dir: "results"
+
+# (Optional) Temporary directory
+temp_dir: "/central/scratch/"
+
+# (Optional) Path to chromosome name map file; set to null or "" to skip chromosome renaming and filtering
+path_chrom_map: "config/chrom_map.txt"
+
+# (Optional) Number of chunks to split FASTQ reads into for parallel processing
+# Set to value [1,100], else default to 2
+num_chunks: 2
+
+# (Required) Bead oligo UMI length
+bead_umi_length: 8
+
+# (Required) Experiment type (DNA vs RNA) or (CHIP-DIP vs SPIDR)
+experiment_type: "RNA"
+
+# (Optional, ChIP-DIP) Mask used for filtering DNA reads
+# e.g., "resources/blacklist_mm10.bed" or "resources/blacklist_hg38.bed"
+# Set to null or "" to skip filtering
+mask: "resources/blacklist_hg38.bed"
+
+# (Required, ChIP-DIP) Bowtie2 indexes for aligning DNA reads
+# e.g., "resources/index_hg38/GRCh38_noalt_as" or "resources/index_mm10/mm10"
+bowtie2_index_dna: "resources/index_mm10/GRCm38.p6"
+
+# (Required, SPIDR) Bowtie2 indexes for aligning RNA repeat reads
+# e.g., "resources/index_ncRNA/ncRNA" or 
+bowtie2_index_rna: "resources/index_ncRNA/ncRNA"
+
+# (Required, SPIDR) Star indexes for aligning RNA reads
+# e.g., "resources/index_star_hg38/
+star_index_rna: "resources/index_star_mm10"
+
+# Merge cluster files for all samples
+# Merge BAM files and bigWigs for individual targets across samples
+merge_samples: true
+
+# Generate BAM files for individual targets
+generate_splitbams: true
+min_oligos: 2
+proportion: 0.8
+max_size: 10000
+
+# bigWig generation parameters
+# - only relevant if generate_splitbams is True
+# - binsize: bin size in bp
+#   - Set to false to skip bigWig generation
+# - bigwig_normalization: "RPKM", "CPM", "BPM", "RPGC", or "None"
+#   - Passed to the --normalizeUsing argument for bamCoverage from the deepTools suite
+binsize: 1000
+bigwig_normalization: "None"
