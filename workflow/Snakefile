@@ -1,0 +1,1416 @@
+"""
+Aim: A Snakemake workflow to process bead barcoding (ChIP-DIP or SPIDR) data
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import datetime
+import pandas as pd
+
+##############################################################################
+# Initialize settings
+##############################################################################
+
+# Copy config file into logs
+v = datetime.datetime.now()
+run_date = v.strftime("%Y.%m.%d")
+
+##############################################################################
+# Load required settings
+##############################################################################
+
+barcode_config = config.get("barcode_config")
+if barcode_config not in (None, ""):
+    print("Using barcode config:", barcode_config, file=sys.stderr)
+else:
+    print("Missing barcode config (barcode_config) in config.yaml", file=sys.stderr)
+    sys.exit()
+
+barcode_format = config.get("barcode_format")
+if barcode_format not in (None, ""):
+    print("Using barcode format file:", barcode_format, file=sys.stderr)
+else:
+    print("Missing barcode format in config.yaml", file=sys.stderr)
+    sys.exit()
+
+samples = config.get("samples")
+if samples not in (None, ""):
+    print("Using samples file:", samples, file=sys.stderr)
+else:
+    print("Missing samples file (samples) in config.yaml", file=sys.stderr)
+    sys.exit()
+
+DIR_SCRIPTS = config.get("scripts_dir")
+if DIR_SCRIPTS is None:
+    print("Scripts directory (scripts_dir) not specificed in config.yaml", file=sys.stderr)
+    sys.exit()
+
+def derive_num_tags(format_file):
+    """
+    Derive num_tags automatically from the barcode format file.
+
+    Each line of the barcode format file is a comma-separated list of tag
+    groups that together make up one valid barcode.
+
+    num_tags is the count of tags on each line: the BPM read-type tag + (optional)
+    DPM read-type tag (identified on read 1) plus split-and-pool round tags 
+    (including the terminal "Y" tag) + (optional) RPM read-type tag (identified on
+    read 2)
+    """
+    with open(format_file) as f:
+        lines = [line.strip() for line in f if line.strip()]
+    if not lines:
+        print(f"Barcode format file is empty: {format_file}", file=sys.stderr)
+        sys.exit()
+    counts = set()
+    for line in lines:
+        tags = [t.strip() for t in line.split(",") if t.strip()]
+        counts.add(len(tags))
+    if len(counts) != 1:
+        print(
+            "Inconsistent number of tags across lines in barcode format file "
+            f"{format_file}: found line lengths {sorted(counts)}. Every line "
+            "must specify the same number of tags.",
+            file=sys.stderr,
+        )
+        sys.exit()
+    return counts.pop()
+
+num_tags = derive_num_tags(barcode_format)
+print("Derived", num_tags, "tags from barcode format file:", barcode_format, file=sys.stderr)
+
+def get_conda_env(default_env_yaml):
+    """
+    Resolve which conda environment a rule's `conda:` directive should use.
+
+    If the optional `conda_env` key is set in config.yaml, it is used instead
+    of `default_env_yaml`, allowing a single persistent conda environment to
+    be built once (e.g. `conda env create -f workflow/envs/pipeline.yaml`)
+    and reused across many working directories/experiments, instead of
+    Snakemake creating a fresh environment from `default_env_yaml` every time.
+    `conda_env` may be either:
+      - the name of an existing conda environment (as listed by
+        `conda env list`), or
+      - a path to an already-built conda environment directory (i.e., a
+        directory containing a `conda-meta` subdirectory).
+
+    If `conda_env` is not set (the default), falls back to `default_env_yaml`
+    -- Snakemake's normal per-rule environment-creation behavior.
+
+    Args
+    - default_env_yaml: str
+        Path to the environment YAML file this rule uses if conda_env is not set.
+
+    Returns
+    - str: either default_env_yaml unchanged, or a resolved path to an
+      existing conda environment.
+    """
+    conda_env = config.get("conda_env")
+    if not conda_env:
+        return default_env_yaml
+
+    # Case 1: a path to an already-built environment directory
+    if os.sep in conda_env or os.path.isdir(conda_env):
+        if not os.path.isdir(os.path.join(conda_env, "conda-meta")):
+            print(
+                f"conda_env is set to '{conda_env}', which does not look like a "
+                "built conda environment directory (no conda-meta subdirectory "
+                "found there). Check the path, or unset conda_env in config.yaml "
+                "to let Snakemake build environments automatically instead.",
+                file=sys.stderr,
+            )
+            sys.exit()
+        return conda_env
+
+    # Case 2: the name of an existing named conda environment
+    try:
+        result = subprocess.run(
+            ["conda", "env", "list", "--json"],
+            capture_output=True, text=True, check=True,
+        )
+        env_paths = json.loads(result.stdout).get("envs", [])
+    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as e:
+        print(
+            f"Could not query conda environments to resolve conda_env='{conda_env}': {e}",
+            file=sys.stderr,
+        )
+        sys.exit()
+
+    matches = [p for p in env_paths if os.path.basename(p) == conda_env]
+    if not matches:
+        available = [os.path.basename(p) for p in env_paths]
+        print(
+            f"conda_env is set to '{conda_env}', but no conda environment with "
+            f"that name was found. Available environments: {available}",
+            file=sys.stderr,
+        )
+        sys.exit()
+    return matches[0]
+
+bead_umi_length = config.get("bead_umi_length")
+if bead_umi_length is not None:
+    bead_umi_length = int(bead_umi_length)
+    print("Using bead UMI length:", bead_umi_length, file=sys.stderr)
+else:
+    print("Bead oligo UMI length not specified in config.yaml", file=sys.stderr)
+    sys.exit()
+
+experiment_type = config.get("experiment_type")
+if experiment_type is not None:
+    assert experiment_type in ["DNA", "RNA", "ChIP-DIP", "SPIDR"]
+    print("Doing workup for:", experiment_type, file=sys.stderr)
+else:
+    print("Experiment type (DNA vs RNA) not specified in config.yaml", file=sys.stderr)
+    sys.exit()
+
+##############################################################################
+# Load experiment dependent settings
+##############################################################################
+if experiment_type in ("DNA", "ChIP-DIP"):
+    bowtie2_index = config.get("bowtie2_index_dna")
+    if bowtie2_index is None:
+        print("Bowtie 2 index not specified in config.yaml", file=sys.stderr)
+        sys.exit()
+
+elif experiment_type in ("RNA", "SPIDR"):
+    bowtie2_index = config.get("bowtie2_index_rna")
+    if bowtie2_index is None:
+        print("Bowtie 2 index not specified in config.yaml", file=sys.stderr)
+        sys.exit()
+
+    star_index = config.get("star_index_rna")
+    if star_index is None:
+        print("Star index not specified in config.yaml", file=sys.stderr)
+        sys.exit()
+
+##############################################################################
+# Load optional settings
+##############################################################################
+
+email = config.get("email")
+if email not in (None, ""):
+    print("If any errors are encountered during the pipeline, an email will be sent to:", email, file=sys.stderr)
+else:
+    print("Email (email) not specified in config.yaml. Will not send email on error.", file=sys.stderr)
+
+DIR_OUT = config.get("output_dir", "results")
+print("Using output directory:", DIR_OUT, file=sys.stderr)
+
+temp_dir = config.get("temp_dir")
+if temp_dir is not None:
+    print("Using temporary directory:", temp_dir, file=sys.stderr)
+else:
+    if "TMPDIR" in os.environ:
+        temp_dir = os.environ["TMPDIR"]
+    else:
+        temp_dir = "/tmp"
+    print("Defaulting to temporary directory:", temp_dir, file=sys.stderr)
+    if not os.path.exists(temp_dir):
+        print(f"Creating temporary directory {temp_dir}.", file=sys.stderr)
+        os.makedirs(temp_dir, exist_ok=True)
+
+num_chunks = config.get("num_chunks")
+if num_chunks is not None:
+    num_chunks = int(num_chunks)
+    assert num_chunks > 0 and num_chunks < 100, "num_chunks must be an integer between 1 and 99."
+    print("Splitting FASTQ files into {} chunks for parallel processing".format(num_chunks),
+          file=sys.stderr)
+else:
+    num_chunks = 2
+    print("Defaulting to 2 chunks for parallel processing", file=sys.stderr)
+
+mask = config.get("mask")
+if mask not in (None, ""):
+    print("Masking reads that align to regions in:", mask, file=sys.stderr)
+else:
+    mask = ""
+    print("(WARNING) Mask path (mask) not specified in config.yaml, no masking will be performed.", file=sys.stderr)
+
+path_chrom_map = config.get("path_chrom_map")
+if path_chrom_map in (None, ""):
+    path_chrom_map = ""
+    print("Chromosome names not specified, will use all chromosomes in the index.",
+          file=sys.stderr)
+
+merge_samples = config.get("merge_samples", False)
+
+generate_splitbams = config.get("generate_splitbams", False)
+if generate_splitbams:
+    min_oligos = config.get("min_oligos", 2)
+    proportion = config.get("proportion", 0.8)
+    max_size = config.get("max_size", 10000)
+    print("Will generate BAM files for individual targets using:", file=sys.stderr)
+    print("\tmin_oligos:", min_oligos, file=sys.stderr)
+    print("\tproportion:", proportion, file=sys.stderr)
+    print("\tmax_size:", max_size, file=sys.stderr)
+else:
+    print("Will not generate BAM files for individual targets.", file=sys.stderr)
+
+binsize = config.get("binsize", False)
+if binsize and not generate_splitbams:
+    print("Will not generate bigWigs, because split BAMs are not being generated", file=sys.stderr)
+    binsize = False
+
+bigwig_normalization = config.get("bigwig_normalization", "None")
+if binsize:
+    assert bigwig_normalization in ("RPKM", "CPM", "BPM", "RPGC", "None"), (
+        'bigwig_normalization config parameter must be one of '
+        '"RPKM", "CPM", "BPM", "RPGC", or "None".'
+    )
+    print(
+        "Will generate bigWig files for individual targets using normalization strategy:",
+        bigwig_normalization,
+        file=sys.stderr
+    )
+
+##############################################################################
+# Location of scripts
+##############################################################################
+
+barcode_identification_efficiency = os.path.join(DIR_SCRIPTS, "python", "barcode_identification_efficiency.py")
+split_barcoded = os.path.join(DIR_SCRIPTS, "python", "split_barcoded.py")
+rename_and_filter_chr = os.path.join(DIR_SCRIPTS, "python", "rename_and_filter_chr.py")
+make_clusters = os.path.join(DIR_SCRIPTS, "python", "make_clusters.py")
+merge_clusters = os.path.join(DIR_SCRIPTS, "python", "merge_clusters.py")
+fastq_to_bam = os.path.join(DIR_SCRIPTS, "python", "fastq_to_bam.py")
+threshold_tag_and_split = os.path.join(DIR_SCRIPTS, "python", "threshold_tag_and_split.py")
+
+cluster_statistics = os.path.join(DIR_SCRIPTS, "python", "generate_cluster_statistics.py")
+cluster_sizes = os.path.join(DIR_SCRIPTS, "python", "get_bead_size_distribution.py")
+cluster_ecdfs = os.path.join(DIR_SCRIPTS, "python", "max_representation_ecdfs_perlib.py")
+
+pipeline_counts = os.path.join(DIR_SCRIPTS, "python", "pipeline_counts.py")
+
+##############################################################################
+# Make output directories
+##############################################################################
+
+DIR_LOGS = os.path.join(DIR_OUT, "logs")
+
+##############################################################################
+# Get sample files and targets
+##############################################################################
+
+with open(samples) as f:
+    FILES = json.load(f)
+ALL_SAMPLES = sorted(FILES.keys())
+
+NUM_CHUNKS = [f"{i:02}" for i in range(num_chunks)]
+
+def get_targets(barcode_config_file):
+    df = pd.read_csv(
+        barcode_config,
+        sep="\t",
+        header=0,
+        comment="#",
+        skip_blank_lines=True,
+        on_bad_lines="error",
+    )
+    targets = [x.replace("BEAD_", "") for x in df["ids"] if "BEAD_" in x]
+    return list(set(targets))
+TARGETS = get_targets(barcode_config)
+
+print("Detected the following targets in the barcode config file:", TARGETS, file=sys.stderr)
+if generate_splitbams:
+    TARGETS += ['ambiguous', 'none', 'uncertain', 'filtered']
+    print("  Adding 'ambiguous', 'none', 'uncertain', and 'filtered' to the list of targets.", file=sys.stderr)
+
+# check that longest file name generated will not exceed 255 characters
+# - longest file name template is {sample}_R1.part_{splitid}.barcoded_dpm.RDtrim.fastq.gz
+# - longest sample + target name template is {sample}.DNA.merged.labeled_{target}.bam.bai
+longest_sample_name = max(map(len, ALL_SAMPLES))
+assert longest_sample_name <= 214, 'Sample names must be <= 214 characters'
+if generate_splitbams:
+    longest_target_name = max(map(len, TARGETS))
+    assert longest_sample_name + longest_target_name <= 227, \
+        'Sample name + target name combined must be <= 227 characters'
+
+##############################################################################
+# Logging
+##############################################################################
+
+CONFIG = [os.path.join(DIR_LOGS, "config_" + run_date + ".json")]
+
+MULTI_QC = [os.path.join(DIR_OUT, "qc", "multiqc_report.html")]
+
+##############################################################################
+# Trimming
+##############################################################################
+
+SPLIT_FASTQ = expand(
+    os.path.join(DIR_OUT, "split_fastq", "{sample}_{read}.part_{splitid}.fastq.gz"),
+    sample=ALL_SAMPLES,
+    read=["R1", "R2"],
+    splitid=NUM_CHUNKS)
+
+TRIM = expand(
+    [os.path.join(DIR_OUT, "trimmed", "{sample}_R1.part_{splitid}_val_1.fq.gz"),
+     os.path.join(DIR_OUT, "trimmed", "{sample}_R2.part_{splitid}_val_2.fq.gz")],
+    sample=ALL_SAMPLES,
+    splitid=NUM_CHUNKS)
+
+TRIM_LOG = expand(
+    os.path.join(DIR_OUT, "trimmed", "{sample}_{read}.part_{splitid}.fastq.gz_trimming_report.txt"),
+    sample=ALL_SAMPLES,
+    read=["R1", "R2"],
+    splitid=NUM_CHUNKS)
+
+##############################################################################
+# Barcoding
+##############################################################################
+
+BARCODEID = expand(
+    os.path.join(DIR_OUT, "fastqs", "{sample}_{read}.part_{splitid}.{type}.fastq.gz"),
+    sample=ALL_SAMPLES,
+    read=["R1", "R2"],
+    type=["barcoded", "unassigned"],
+    splitid=NUM_CHUNKS)
+
+BID_EFFICIENCY_ALL = expand(os.path.join(DIR_OUT, "{sample}.bid_efficiency.txt"), sample=ALL_SAMPLES)
+
+##############################################################################
+# DNA
+##############################################################################
+TRIM_DPM = expand(
+    os.path.join(DIR_OUT, "trimmed", "{sample}_R1.part_{splitid}.barcoded_dpm.RDtrim.fastq.gz"),
+    sample=ALL_SAMPLES,
+    splitid=NUM_CHUNKS)
+
+SPLIT_BPM_DPM = expand(
+    [os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded_bpm.fastq.gz"),
+     os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded_dpm.fastq.gz")],
+    sample=ALL_SAMPLES,
+    splitid=NUM_CHUNKS)
+
+
+Bt2_DNA_ALIGN = expand(
+    os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.DNA.bowtie2.mapq20.bam"),
+    sample=ALL_SAMPLES,
+    splitid=NUM_CHUNKS)
+
+CHR_DNA = expand(
+    os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.DNA.chr.bam"),
+    sample=ALL_SAMPLES,
+    splitid=NUM_CHUNKS)
+
+MASKED = expand(
+    os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.DNA.chr.masked.bam"),
+    sample=ALL_SAMPLES,
+    splitid=NUM_CHUNKS)
+
+MERGE_DNA = expand(
+    os.path.join(DIR_OUT, "alignments", "{sample}.DNA.merged.bam"),
+    sample=ALL_SAMPLES)
+
+##############################################################################
+# RNA
+##############################################################################
+TRIM_RPM = expand(
+    os.path.join(DIR_OUT, "trimmed", "{sample}_{type}.part_{splitid}.barcoded_rpm.RDtrim.fastq.gz"),
+    type = ["R1","R2"],
+    sample=ALL_SAMPLES,
+    splitid=NUM_CHUNKS)
+
+SPLIT_RPM_BPM = expand(
+    [os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded_bpm.fastq.gz"),
+     os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded_rpm.fastq.gz"),
+     os.path.join(DIR_OUT, "fastqs", "{sample}_R2.part_{splitid}.barcoded_rpm.fastq.gz")], 
+     sample=ALL_SAMPLES, 
+     splitid=NUM_CHUNKS)
+
+BT2_RNA_ALIGN = expand(
+     [os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.bowtie2.sorted.mapped.bam"),
+      os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.bowtie2.sorted.unmapped.bam"),
+      os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.bowtie2.sorted.mapped.bam.bai")],
+      sample=ALL_SAMPLES, 
+      splitid=NUM_CHUNKS)
+
+BAM_TO_FASTQ = expand(
+      [os.path.join(DIR_OUT, "fastqs", "{sample}.part_{splitid}.bowtie2.unmapped_R1.fq.gz"),
+       os.path.join(DIR_OUT, "fastqs", "{sample}.part_{splitid}.bowtie2.unmapped_R2.fq.gz")],
+       sample=ALL_SAMPLES, 
+       splitid=NUM_CHUNKS)
+
+STAR_ALIGN = expand(
+       os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.Aligned.sortedByCoord.out.bam"), 
+       sample=ALL_SAMPLES, 
+       splitid=NUM_CHUNKS)
+
+CHR_RNA = expand(
+        os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.Aligned.sortedByCoord.out.chr.bam"),
+        sample=ALL_SAMPLES, 
+        splitid=NUM_CHUNKS)
+
+MERGE_RNA = expand(
+      os.path.join(DIR_OUT, "alignments", "{sample}.RNA.merged.bam"), 
+      sample = ALL_SAMPLES)
+
+##############################################################################
+# Bead workup
+##############################################################################
+
+FASTQ_TO_BAM = expand(
+    os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.BPM.bam"),
+    sample=ALL_SAMPLES,
+    splitid=NUM_CHUNKS)
+
+MERGE_BEAD = expand(
+    os.path.join(DIR_OUT, "alignments", "{sample}.merged.BPM.bam"),
+    sample=ALL_SAMPLES)
+
+##############################################################################
+# Clustering
+##############################################################################
+
+CLUSTERS = expand(
+    os.path.join(DIR_OUT, "clusters_parts", "{sample}.part_{splitid}.clusters"),
+    sample=ALL_SAMPLES,
+    splitid=NUM_CHUNKS)
+
+CLUSTERS_MERGED = expand(
+    os.path.join(DIR_OUT, "clusters", "{sample}.clusters"),
+    sample=ALL_SAMPLES)
+
+##############################################################################
+# Post Clustering
+##############################################################################
+
+CLUSTER_STATISTICS = [os.path.join(DIR_OUT, "clusters", "cluster_statistics.txt")]
+
+CLUSTER_SIZES = [os.path.join(DIR_OUT, "clusters", "DPM_read_distribution.pdf"),
+         os.path.join(DIR_OUT, "clusters", "DPM_cluster_distribution.pdf"),
+         os.path.join(DIR_OUT, "clusters", "BPM_cluster_distribution.pdf"),
+         os.path.join(DIR_OUT, "clusters", "BPM_read_distribution.pdf"),
+         os.path.join(DIR_OUT, "clusters", "RPM_read_distribution.pdf"),
+         os.path.join(DIR_OUT, "clusters", "RPM_cluster_distribution.pdf")]
+
+ECDFS = [os.path.join(DIR_OUT, "clusters", "Max_representation_ecdf.pdf"),
+         os.path.join(DIR_OUT, "clusters", "Max_representation_counts.pdf")]
+
+LABELED_BAMS = expand(
+    os.path.join(DIR_OUT, "alignments", "{sample}.labeled.bam"),
+    sample=ALL_SAMPLES)
+
+SPLITBAMS = expand(
+    os.path.join(DIR_OUT, "splitbams", "{sample}.labeled_{target}.bam"),
+    sample=ALL_SAMPLES,
+    target=TARGETS)
+
+SPLITBAMS_STATISTICS = [os.path.join(DIR_OUT, "splitbams", "splitbam_statistics.txt")]
+
+SPLITBAMS_MERGED = expand(
+    os.path.join(DIR_OUT, "splitbams", "{target}.bam"),
+    target=TARGETS)
+
+BIGWIGS = expand(
+    os.path.join(DIR_OUT, "bigwigs", "{sample}.labeled_{target}.bw"),
+    sample=ALL_SAMPLES,
+    target=TARGETS)
+
+BIGWIGS_MERGED = expand(
+    os.path.join(DIR_OUT, "bigwigs", "{target}.bw"),
+    target=TARGETS)
+
+CLUSTERS_ALL = [os.path.join(DIR_OUT, "clusters", "all.clusters")]
+
+PIPELINE_COUNTS = [os.path.join(DIR_OUT, "pipeline_counts.txt")]
+
+FINAL = MERGE_BEAD + CLUSTER_SIZES + ECDFS + CLUSTER_STATISTICS + BID_EFFICIENCY_ALL + MULTI_QC + CONFIG + PIPELINE_COUNTS
+
+if experiment_type in ("RNA", "SPIDR"):
+    FINAL+= MERGE_RNA
+else:
+    FINAL+= MERGE_DNA
+
+if merge_samples:
+    FINAL.extend(CLUSTERS_ALL)
+if generate_splitbams:
+    FINAL.extend(SPLITBAMS + SPLITBAMS_STATISTICS)
+    if merge_samples:
+        FINAL.extend(SPLITBAMS_MERGED)
+    if binsize:
+        FINAL.extend(BIGWIGS)
+        if merge_samples:
+            FINAL.extend(BIGWIGS_MERGED)
+
+##############################################################################
+##############################################################################
+# RULE ALL
+##############################################################################
+##############################################################################
+
+rule all:
+    input:
+        FINAL
+
+# Send and email if an error occurs during execution
+onerror:
+    if email not in (None, ""):
+        shell('mail -s "an error occurred" ' + email + ' < {log}')
+
+wildcard_constraints:
+    sample = r"[^\.]+",
+    target = "|".join([re.escape(x) for x in TARGETS])
+
+# Output all snakemake configuration parameters into logs folder with run date
+rule log_config:
+    output:
+        CONFIG
+    run:
+        with open(output[0], "wt") as f:
+            json.dump(config, f, indent=4, sort_keys=True)
+
+##############################################################################
+# Trimming and barcode identification
+##############################################################################
+
+# Split fastq files into chunks to processes in parallel
+rule split_fastq:
+    wildcard_constraints:
+        read="R1|R2"
+    input:
+        lambda wildcards: FILES[wildcards.sample][wildcards.read],
+    output:
+        expand(os.path.join(DIR_OUT, "split_fastq", "{{sample}}_{{read}}.part_{splitid}.fastq.gz"),splitid=NUM_CHUNKS)
+    log:
+        os.path.join(DIR_LOGS, "split_fastq.{sample}.{read}.log")
+    params:
+        outstring = ' '.join(expand("-o " + os.path.join(DIR_OUT, "split_fastq", "{{sample}}_{{read}}.part_{splitid}.fastq.gz"), splitid=NUM_CHUNKS))  
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        8
+    shell:
+        '''
+        fastqsplitter -i {input} {params.outstring} -t {threads}
+        '''
+
+# Trim adaptors
+rule adaptor_trimming:
+    input:
+        [os.path.join(DIR_OUT, "split_fastq", "{sample}_R1.part_{splitid}.fastq.gz"),
+         os.path.join(DIR_OUT, "split_fastq", "{sample}_R2.part_{splitid}.fastq.gz")]
+    output:
+         os.path.join(DIR_OUT, "trimmed", "{sample}_R1.part_{splitid}_val_1.fq.gz"),
+         os.path.join(DIR_OUT, "trimmed", "{sample}_R1.part_{splitid}.fastq.gz_trimming_report.txt"),
+         os.path.join(DIR_OUT, "trimmed", "{sample}_R2.part_{splitid}_val_2.fq.gz"),
+         os.path.join(DIR_OUT, "trimmed", "{sample}_R2.part_{splitid}.fastq.gz_trimming_report.txt")
+    log:
+        os.path.join(DIR_LOGS, "adaptor_trimming.{sample}.{splitid}.log")
+    params:
+        dir = os.path.join(DIR_OUT, "trimmed")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        10
+    shell:
+        '''
+        if [[ {threads} -gt 8 ]]; then
+            cores=2
+        else
+            cores=1
+        fi
+
+        trim_galore \\
+          --paired \\
+          --gzip \\
+          --cores $cores \\
+          --quality 20 \\
+          --fastqc \\
+          -o "{params.dir}" \\
+          {input:q} &> "{log}"
+        '''
+
+# Identify barcodes using splitcode
+rule barcode_id:
+    input:
+        r1 = os.path.join(DIR_OUT, "trimmed", "{sample}_R1.part_{splitid}_val_1.fq.gz"),
+        r2 = os.path.join(DIR_OUT, "trimmed", "{sample}_R2.part_{splitid}_val_2.fq.gz")
+    output:
+        r1_barcoded = os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded.fastq.gz"),
+        r2_barcoded = os.path.join(DIR_OUT, "fastqs", "{sample}_R2.part_{splitid}.barcoded.fastq.gz"),
+        r1_unassigned = os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.unassigned.fastq.gz"),
+        r2_unassigned = os.path.join(DIR_OUT, "fastqs", "{sample}_R2.part_{splitid}.unassigned.fastq.gz")
+    params:
+        mapping=os.path.join(DIR_OUT, "fastqs", "mapping.{sample}.{splitid}.txt")
+    log:
+        os.path.join(DIR_LOGS, "barcode_id.{sample}.{splitid}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    shell:
+        '''
+        splitcode --assign -N 2 \\
+          -o "{output.r1_barcoded}","{output.r2_barcoded}" \\
+          --unassigned="{output.r1_unassigned}","{output.r2_unassigned}" \\
+          -c "{barcode_config}" --keep-grp="{barcode_format}" \\
+          --mod-names --mapping="{params.mapping}" --no-outb \\
+          --gzip  "{input.r1}" "{input.r2}" &> "{log}"
+        '''
+
+# Calculate barcode identification efficiency
+rule barcode_identification_efficiency:
+    input:
+        assigned = expand(os.path.join(DIR_OUT, "fastqs", "{{sample}}_R1.part_{splitid}.barcoded.fastq.gz"), splitid=NUM_CHUNKS),
+        unassigned = expand(os.path.join(DIR_OUT, "fastqs", "{{sample}}_R1.part_{splitid}.unassigned.fastq.gz"), splitid=NUM_CHUNKS)
+    output:
+        os.path.join(DIR_OUT, "{sample}.bid_efficiency.txt")
+    log:
+        os.path.join(DIR_LOGS, "barcode_identification_efficiency.{sample}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    shell:
+        '''
+        python "{barcode_identification_efficiency}" --assigned "{input.assigned}" --unassigned "{input.unassigned}" --config "{barcode_config}" --format "{barcode_format}" > "{output}" 2> "{log}"
+        '''
+        
+if experiment_type in ("DNA", "ChIP-DIP"):
+    # Split barcoded reads into BPM and DPM
+    rule split_bpm_dpm:
+        input:
+            os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded.fastq.gz")
+        output:
+            os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded_dpm.fastq.gz"),
+            os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded_bpm.fastq.gz"),
+        log:
+            os.path.join(DIR_LOGS, "split_bpm_dpm.{sample}.{splitid}.log")
+        conda:
+            get_conda_env("envs/pipeline.yaml")
+        shell:
+            '''
+            python "{split_barcoded}" --input "{input}" --type "{experiment_type}" &> "{log}"
+            '''
+elif experiment_type in ("RNA", "SPIDR"):
+    # Split barcoded reads into BPM and RPM, output R1 and R2 for rpm
+    rule split_bpm_rpm:
+        input:
+            os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded.fastq.gz")
+        output:
+            os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded_rpm.fastq.gz"),
+            os.path.join(DIR_OUT, "fastqs", "{sample}_R2.part_{splitid}.barcoded_rpm.fastq.gz"),
+            os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded_bpm.fastq.gz"),
+        log:
+            os.path.join(DIR_LOGS, "split_bpm_rpm.{sample}.{splitid}.log")
+        conda:
+            get_conda_env("envs/pipeline.yaml")
+        shell:
+            '''
+            python "{split_barcoded}" --input "{input}" --type "{experiment_type}" &> "{log}"
+            '''
+
+##############################################################################
+# Cutadapt
+##############################################################################
+
+# Trim DPM readthrough from read1 of DPM reads, remove short reads (DPM dimer)
+rule cutadapt_dpm:
+    input:
+        os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded_dpm.fastq.gz")
+    output:
+        fastq = os.path.join(DIR_OUT, "trimmed", "{sample}_R1.part_{splitid}.barcoded_dpm.RDtrim.fastq.gz"),
+        qc = os.path.join(DIR_OUT, "trimmed", "{sample}_R1.part_{splitid}.barcoded_dpm.RDtrim.qc.txt")
+    log:
+        os.path.join(DIR_LOGS, "cutadapt_dpm.{sample}.{splitid}.log")
+    params:
+        adapters_r1 = "-a GATCGGAAGAG -a ATCAGCACTTA", 
+        others = "--minimum-length 20"
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        10
+    shell:
+        '''
+        {{
+            cutadapt \\
+              {params.adapters_r1} \\
+              {params.others} \\
+              -o "{output.fastq}" \\
+              -j {threads} \\
+              "{input}" > "{output.qc}"
+
+            fastqc "{output.fastq}"
+        }} &> "{log}"
+        '''
+
+# Trim rpm readthrough from read 1 and from end of read2
+rule cutadapt_rpm:
+    input:
+        read1 = os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded_rpm.fastq.gz"),
+        read2 = os.path.join(DIR_OUT, "fastqs", "{sample}_R2.part_{splitid}.barcoded_rpm.fastq.gz")
+    output:
+        read1 = os.path.join(DIR_OUT, "trimmed", "{sample}_R1.part_{splitid}.barcoded_rpm.RDtrim.fastq.gz"),
+        read2 = os.path.join(DIR_OUT, "trimmed", "{sample}_R2.part_{splitid}.barcoded_rpm.RDtrim.fastq.gz"),
+        qc = os.path.join(DIR_OUT, "trimmed", "{sample}_R1.part_{splitid}.barcoded_rpm.RDtrim.qc.txt")
+    log:
+        os.path.join(DIR_LOGS, "cutadapt_rpm.{sample}.{splitid}.log")
+    params:
+        adapters_r1 = "-a ATCAGCACTTAGCGTCAG",
+        adapters_r2 = "-G CTGACGCTAAGTGCTGAT",
+        others = "-q 20,20 --minimum-length 20"
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        10
+    shell:
+        '''
+        {{
+            cutadapt \\
+              {params.adapters_r1} \\
+              {params.adapters_r2} \\
+              {params.others} \\
+              -o "{output.read1}" \\
+              -p "{output.read2}" \\
+              -j {threads} \\
+              "{input.read1}" "{input.read2}" > "{output.qc}"
+            fastqc "{output.read1}"
+        }} &> "{log}"
+        '''
+
+##############################################################################
+# DNA alignment
+##############################################################################
+
+# Align DPM reads
+rule bowtie2_align_dna:
+    input:
+        os.path.join(DIR_OUT, "trimmed", "{sample}_R1.part_{splitid}.barcoded_dpm.RDtrim.fastq.gz")
+    output:
+        os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.DNA.bowtie2.mapq20.bam")
+    log:
+        os.path.join(DIR_LOGS, "bowtie2_align_dna.{sample}.{splitid}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        10
+    resources:
+        tmpdir=temp_dir
+    shell:
+        '''
+        {{
+            bowtie2 \\
+              -p {threads} \\
+              -t \\
+              --phred33 \\
+              -x "{bowtie2_index}" \\
+              -U "{input}" |
+            samtools view -bq 20 -F 4 -F 256 - |
+            samtools sort -@ {threads} -T "$TMPDIR" -o "{output}"
+        }} &> "{log}"
+        '''
+
+# Rename chromosome names and filter for chromosomes of interest
+rule rename_and_filter_chr:
+    input:
+        os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.DNA.bowtie2.mapq20.bam")
+    output:
+        os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.DNA.chr.bam")
+    log:
+        os.path.join(DIR_LOGS, "rename_and_filter_chr.{sample}.{splitid}.log")
+    params:
+        chrom_map = f"--chrom_map '{path_chrom_map}'" if path_chrom_map != "" else ""
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        4
+    resources:
+        tmpdir=temp_dir
+    shell:
+        '''
+        python "{rename_and_filter_chr}" {params.chrom_map} -t {threads} --try-symlink \\
+            -o "{output}" "{input}" &> "{log}"
+        '''
+
+rule repeat_mask:
+    input:
+        os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.DNA.chr.bam"),
+    output:
+        os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.DNA.chr.masked.bam")
+    log:
+        os.path.join(DIR_LOGS, "repeat_mask.{sample}.{splitid}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    shell:
+        '''
+        {{
+            if [ -n "{mask}" ]; then
+                # -v: only report entries in A that have no overlap in B
+                bedtools intersect \\
+                    -v \\
+                    -a "{input}" \\
+                    -b "{mask}"  > "{output}"
+            else
+                echo "No mask file specified, skipping masking."
+
+                # Create a symbolic link between the output path and the input path,
+                # effectively skipping the masking step.
+                case "{input}" in
+                    /*) path_input="{input}";;
+                    *) path_input="$(pwd -P)"/"{input}";;
+                esac
+                ln -s "$path_input" "{output}"
+            fi
+        }} &> "{log}"
+        '''
+
+# Combine all mapped DNA reads into a single bam file per sample
+rule merge_dna:
+    input:
+        expand(
+            os.path.join(DIR_OUT, "alignments_parts", "{{sample}}.part_{splitid}.DNA.chr.masked.bam"),
+            splitid=NUM_CHUNKS)
+    output:
+        os.path.join(DIR_OUT, "alignments", "{sample}.DNA.merged.bam")
+    log:
+        os.path.join(DIR_LOGS, "merge_dna.{sample}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        10
+    shell:
+        '''
+        samtools merge -@ {threads} "{output}" {input:q} &> "{log}"
+        '''
+##############################################################################
+# RNA Alignment
+##############################################################################
+
+# Align RPM reads to repeat genome
+rule bowtie2_align_rna:
+    input:
+        fq1 = os.path.join(DIR_OUT, "trimmed", "{sample}_R1.part_{splitid}.barcoded_rpm.RDtrim.fastq.gz"),
+        fq2 = os.path.join(DIR_OUT, "trimmed", "{sample}_R2.part_{splitid}.barcoded_rpm.RDtrim.fastq.gz")
+    output:
+        mapped = os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.bowtie2.mapped.bam"),
+        unmapped = os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.bowtie2.unmapped.bam")
+    log:
+        os.path.join(DIR_LOGS, "bowtie2_align_rna.{sample}.{splitid}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        10
+    resources:
+        tmpdir=temp_dir
+    shell:
+        '''
+        {{
+            bowtie2 \\
+              -p {threads} \\
+              -t \\
+              -x "{bowtie2_index}" \\
+              -1 "{input.fq1}" -2 "{input.fq2}"  | \
+            samtools view -b -h -F 4 -U "{output.unmapped}" - | 
+            samtools sort -@ {threads} -T "$TMPDIR" -o "{output.mapped}"
+        }} &> "{log}"
+        '''
+
+# Convert unaligned back to fastq
+rule bam_to_fastq:
+    input:
+        os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.bowtie2.unmapped.bam")
+    output:
+        r1 = os.path.join(DIR_OUT, "fastqs", "{sample}.part_{splitid}.bowtie2.unmapped_R1.fq.gz"),
+        r2 = os.path.join(DIR_OUT, "fastqs", "{sample}.part_{splitid}.bowtie2.unmapped_R2.fq.gz")
+    log:
+        os.path.join(DIR_LOGS, "bam2fq.{sample}.{splitid}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        10
+    resources:
+        tmpdir=temp_dir
+    shell:
+        '''
+        {{
+            samtools sort -n -o - "{input}" | \
+            samtools fastq -1 "{output.r1}" -2 "{output.r2}" -0 /dev/null -s /dev/null -n 
+        }} &> "{log}"
+        '''
+
+# Align RPM reads to genome
+rule star_align:
+    input:
+        r1 = os.path.join(DIR_OUT, "fastqs", "{sample}.part_{splitid}.bowtie2.unmapped_R1.fq.gz"),
+        r2 = os.path.join(DIR_OUT, "fastqs", "{sample}.part_{splitid}.bowtie2.unmapped_R2.fq.gz")
+    output:
+        os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.Aligned.sortedByCoord.out.bam")
+    log:
+        os.path.join(DIR_LOGS, "star_align.{sample}.{splitid}.log")
+    params:
+        star_options = "--readFilesCommand zcat --alignEndsType EndToEnd --outFilterScoreMin 10 --outFilterMultimapNmax 1 --outFilterMismatchNmax 10 --alignIntronMax 100000 --alignMatesGapMax 1300 --alignIntronMin 80 --alignSJDBoverhangMin 5 --alignSJoverhangMin 8 --chimSegmentMin 20 --alignSJstitchMismatchNmax 5 -1 5 5 --outSAMtype BAM SortedByCoordinate",
+         prefix = os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        10
+    resources:
+        tmpdir=temp_dir
+    shell:
+        '''
+        {{
+            STAR \\
+              --genomeDir {star_index} \\
+              --readFilesIn "{input.r1}" "{input.r2}" \\
+              --runThreadN {threads} {params.star_options} \\
+              --outFileNamePrefix {params.prefix} 
+        }} &> "{log}"
+        '''
+
+# Rename chromosome names and filter for chromosomes of interest
+rule rename_and_filter_chr_rna:
+    input:
+        star = os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.Aligned.sortedByCoord.out.bam"),
+    output:
+        star = os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.Aligned.sortedByCoord.out.chr.bam"),
+    log:
+        os.path.join(DIR_LOGS, "rename_and_filter_chr.{sample}.{splitid}.log")
+    params:
+        chrom_map = f"--chrom_map '{path_chrom_map}'" if path_chrom_map != "" else ""
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        4
+    resources:
+        tmpdir=temp_dir
+    shell:
+        '''
+        {{
+            python "{rename_and_filter_chr}" {params.chrom_map} -t {threads} --try-symlink \\
+                -o "{output.star}" "{input.star}" 
+        }} &> "{log}"
+        '''
+
+# Combine all mapped RNA reads into a single bam file per sample
+rule merge_rna:
+    input:
+        bt2 = expand(os.path.join(DIR_OUT, "alignments_parts", "{{sample}}.part_{splitid}.bowtie2.mapped.bam"),splitid=NUM_CHUNKS),
+        star = expand(os.path.join(DIR_OUT, "alignments_parts", "{{sample}}.part_{splitid}.Aligned.sortedByCoord.out.chr.bam"), splitid=NUM_CHUNKS)
+    output:
+        os.path.join(DIR_OUT, "alignments", "{sample}.RNA.merged.bam")
+    log:
+        os.path.join(DIR_LOGS, "merge_rna.{sample}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        10
+    shell:
+        '''
+        samtools merge -@ {threads} "{output}" {input.bt2:q} {input.star:q} &> "{log}"
+        '''
+
+##############################################################################
+# Workup Bead Oligo
+##############################################################################
+
+# Convert the BPM FASTQ reads into a BAM file, keeping the UMI
+rule fastq_to_bam:
+    input:
+        os.path.join(DIR_OUT, "fastqs", "{sample}_R1.part_{splitid}.barcoded_bpm.fastq.gz")
+    output:
+        sorted = os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.BPM.bam"),
+        bam = temp(os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.BPM.unsorted.bam"))
+    log:
+        os.path.join(DIR_LOGS, "fastq_to_bam.{sample}.{splitid}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        4
+    resources:
+        tmpdir=temp_dir
+    shell:
+        '''
+        {{
+            python "{fastq_to_bam}" "{input}" "{output.bam}" "{barcode_config}" "{bead_umi_length}"
+            samtools sort -@ {threads} -T "$TMPDIR" -o "{output.sorted}" "{output.bam}"
+        }} &> "{log}"
+        '''
+
+# Combine all oligo reads into a single file per sample
+rule merge_beads:
+    input:
+        expand(
+            os.path.join(DIR_OUT, "alignments_parts", "{{sample}}.part_{splitid}.BPM.bam"),
+            splitid=NUM_CHUNKS)
+    output:
+        os.path.join(DIR_OUT, "alignments", "{sample}.merged.BPM.bam")
+    log:
+        os.path.join(DIR_LOGS, "merge_beads.{sample}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        10
+    shell:
+        '''
+        samtools merge -@ {threads} "{output}" {input:q} &> "{log}"
+        '''
+
+##############################################################################
+# Make clusters
+##############################################################################
+
+def get_cluster_input(wildcards):
+    beads = os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.BPM.bam")
+    if experiment_type in ("DNA", "ChIP-DIP"):
+        dna =  os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.DNA.chr.masked.bam")
+        return beads, dna
+    elif experiment_type in ("RNA", "SPIDR"):
+        rna1 =  os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.bowtie2.mapped.bam")
+        rna2 =  os.path.join(DIR_OUT, "alignments_parts", "{sample}.part_{splitid}.Aligned.sortedByCoord.out.chr.bam") 
+        return beads, rna1, rna2
+
+# Make clusters from aligned reads and oligo reads
+rule make_clusters:
+    input:
+       get_cluster_input
+    output:
+        unsorted = temp(os.path.join(DIR_OUT, "clusters_parts", "{sample}.part_{splitid}.unsorted.clusters")),
+        sorted = os.path.join(DIR_OUT, "clusters_parts", "{sample}.part_{splitid}.clusters")
+    log:
+        os.path.join(DIR_LOGS, "make_clusters.{sample}.{splitid}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        4
+    resources:
+        tmpdir=temp_dir
+    shell:
+        '''
+        {{
+            python "{make_clusters}" -i "{input}" -o "{output.unsorted}" -n {num_tags}
+
+            sort -k 1 --parallel={threads} "{output.unsorted}" > "{output.sorted}"
+        }} &> "{log}"
+        '''
+
+# Merge clusters from parallel processing into a single cluster file per sample
+rule merge_clusters:
+    input:
+        expand(
+            os.path.join(DIR_OUT, "clusters_parts", "{{sample}}.part_{splitid}.clusters"),
+            splitid=NUM_CHUNKS)
+    output:
+        mega = temp(os.path.join(DIR_OUT, "clusters", "{sample}.duplicated.clusters")),
+        final = os.path.join(DIR_OUT, "clusters", "{sample}.clusters")
+    log:
+        os.path.join(DIR_LOGS, "merge_clusters.{sample}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        10
+    resources:
+        tmpdir=temp_dir
+    shell:
+        '''
+        {{
+            sort -k 1 --parallel={threads} -m {input:q} > "{output.mega}"
+            python "{merge_clusters}" -i "{output.mega}" -o "{output.final}"
+        }} &> "{log}"
+        '''
+
+rule clusters_all:
+    input:
+        CLUSTERS_MERGED
+    output:
+        CLUSTERS_ALL
+    log:
+        os.path.join(DIR_LOGS, "clusters_all.log")
+    threads:
+        10
+    resources:
+        tmpdir=temp_dir
+    shell:
+        '''
+        sort -k 1 --parallel={threads} -m {input:q} > "{output}" 2> "{log}"
+        '''
+
+##############################################################################
+# Profile clusters
+##############################################################################
+
+# Generate simple statistics for clusters
+rule generate_cluster_statistics:
+    input:
+        (CLUSTERS_ALL + CLUSTERS_MERGED) if merge_samples else CLUSTERS_MERGED
+    output:
+        CLUSTER_STATISTICS
+    log:
+        os.path.join(DIR_LOGS, "generate_cluster_statistics.log")
+    params:
+        dir = os.path.join(DIR_OUT, "clusters")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    shell:
+        '''
+        python "{cluster_statistics}" --directory "{params.dir}" --pattern .clusters > "{output}" 2> "{log}"
+        '''
+
+# Generate ecdfs of oligo distribution
+rule generate_cluster_ecdfs:
+    input:
+        (CLUSTERS_ALL + CLUSTERS_MERGED) if merge_samples else CLUSTERS_MERGED
+    output:
+        ecdf = os.path.join(DIR_OUT, "clusters", "Max_representation_ecdf.pdf"),
+        counts = os.path.join(DIR_OUT, "clusters", "Max_representation_counts.pdf")
+    log:
+        os.path.join(DIR_LOGS, "generate_cluster_ecdfs.log")
+    params:
+        dir = os.path.join(DIR_OUT, "clusters")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    shell:
+        '''
+        python "{cluster_ecdfs}" --directory "{params.dir}" --pattern .clusters --xlim 30 &> "{log}"
+        '''
+
+# Profile size distribution of clusters
+rule get_size_distribution:
+    input:
+        (CLUSTERS_ALL + CLUSTERS_MERGED) if merge_samples else CLUSTERS_MERGED
+    output:
+        dpm = os.path.join(DIR_OUT, "clusters", "DPM_read_distribution.pdf"),
+        dpm2 = os.path.join(DIR_OUT, "clusters", "DPM_cluster_distribution.pdf"),
+        bpm = os.path.join(DIR_OUT, "clusters", "BPM_read_distribution.pdf"),
+        bpm2 = os.path.join(DIR_OUT, "clusters", "BPM_cluster_distribution.pdf"),
+        rpm = os.path.join(DIR_OUT, "clusters", "RPM_read_distribution.pdf"),
+        rpm2 = os.path.join(DIR_OUT, "clusters", "RPM_cluster_distribution.pdf")
+    log:
+        os.path.join(DIR_LOGS, "get_size_distribution.log")
+    params:
+        dir = os.path.join(DIR_OUT, "clusters")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    shell:
+        '''
+        {{
+            python "{cluster_sizes}" --directory "{params.dir}" --pattern .clusters --readtype BPM
+            python "{cluster_sizes}" --directory "{params.dir}" --pattern .clusters --readtype DPM
+            python "{cluster_sizes}" --directory "{params.dir}" --pattern .clusters --readtype RPM
+        }} &> "{log}"
+        '''
+
+##############################################################################
+# Logging and MultiQC
+##############################################################################
+
+# Aggregate metrics using multiqc
+rule multiqc:
+    input:
+        CLUSTERS_MERGED
+    output:
+        os.path.join(DIR_OUT, "qc", "multiqc_report.html")
+    log:
+        os.path.join(DIR_LOGS, "multiqc.log")
+    params:
+        dir_qc = os.path.join(DIR_OUT, "qc")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    resources:
+        tmpdir=temp_dir
+    shell:
+        '''
+        multiqc -f -o "{params.dir_qc}" "{DIR_OUT}" &> "{log}"
+        '''
+
+rule pipeline_counts:
+    input:
+        SPLIT_FASTQ + TRIM + BARCODEID + \
+        FASTQ_TO_BAM + MERGE_BEAD  + CLUSTERS + \
+        CLUSTERS_MERGED + (SPLITBAMS if generate_splitbams else [])
+    output:
+        csv = os.path.join(DIR_OUT, "qc", "pipeline_counts.csv"),
+        pretty = os.path.join(DIR_OUT, "pipeline_counts.txt")
+    log:
+        os.path.join(DIR_LOGS, "pipeline_counts.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        10
+    resources:
+        tmpdir=temp_dir
+    shell:
+        '''
+        {{
+            python "{pipeline_counts}" \\
+              --samples "{samples}" \\
+              -w "{DIR_OUT}" \\
+              -o "{output.csv}" \\
+              -n {threads} |
+            column -t -s $'\\t' > "{output.pretty}"
+        }} &> "{log}"
+        '''
+
+##############################################################################
+# Splitbams
+##############################################################################
+
+def get_splitbam_input(wildcards):
+    if experiment_type in ("DNA", "ChIP-DIP"):
+        return os.path.join(DIR_OUT, "alignments", "{sample}.DNA.merged.bam")
+    elif experiment_type in ("RNA", "SPIDR"):
+        return os.path.join(DIR_OUT, "alignments", "{sample}.RNA.merged.bam")
+
+# Generate bam files for individual targets based on assignments from clusterfile
+rule threshold_tag_and_split:
+    input:
+        clusters = os.path.join(DIR_OUT, "clusters", "{sample}.clusters"),
+        bam = get_splitbam_input
+    output:
+        expand(
+            os.path.join(DIR_OUT, "splitbams", "{{sample}}.labeled_{target}.bam"),
+            target=TARGETS
+        )
+    log:
+        os.path.join(DIR_LOGS, "threshold_tag_and_split.{sample}.log")
+    params:
+        dir_splitbams = os.path.join(DIR_OUT, "splitbams"),
+        labeled_bam = os.path.join(DIR_OUT, "alignments", "{sample}.labeled.bam")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    shell:
+        '''
+        {{
+            python "{threshold_tag_and_split}" \\
+                "{input.bam}" \\
+                "{params.labeled_bam}" \\
+                "{input.clusters}" \\
+                "{params.dir_splitbams}" \\
+                --min_oligos {min_oligos} \\
+                --proportion {proportion} \\
+                --max_size {max_size} \\
+                --num_tags {num_tags}
+
+            # touch BAM files for targets that did not get any reads passing our filters
+            paths=({output:q})
+            for path in "${{paths[@]}}"; do
+                if [ ! -f "$path" ]; then
+                    target="$(echo "$path" | sed -E -e 's/.*\\.labeled_(.*)\\.bam/\\1/')"
+                    echo "No split BAM file generated for target ${{target}} at ${{path}}. Touching ${{path}}."
+                    touch "$path"
+                fi
+            done
+        }} &> "{log}"
+        '''
+
+# for each target, merge splitbams across samples
+rule splitbams_merged:
+    input:
+        expand(
+            os.path.join(DIR_OUT, "splitbams", "{sample}.labeled_{{target}}.bam"),
+            sample=ALL_SAMPLES)
+    output:
+        os.path.join(DIR_OUT, "splitbams", "{target}.bam")
+    log:
+        os.path.join(DIR_LOGS, "splitbams_merged.{target}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        4
+    shell:
+        '''
+        {{
+            # check which input BAM files are non-empty
+            all_paths=({input:q})
+            non_empty_paths=()
+            for path in "${{all_paths[@]}}"; do
+                if [ -s "$path" ]; then
+                    non_empty_paths+=("$path")
+                fi
+            done
+
+            if [ ${{#non_empty_paths[@]}} -eq 0 ]; then
+                echo "All BAM files for the target are empty. Creating empty merged BAM file."
+                touch "{output}"
+            else
+                samtools merge -f -@ {threads} "{output}" "${{non_empty_paths[@]}}"
+            fi
+        }} &> "{log}"
+        '''
+
+rule index_splitbams:
+    input:
+        os.path.join(DIR_OUT, "splitbams", "{file}.bam")
+    output:
+        os.path.join(DIR_OUT, "splitbams", "{file}.bam.bai")
+    log:
+        os.path.join(DIR_LOGS, "index_splitbams.{file}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        4
+    shell:
+        '''
+        {{
+            if [ -s "{input}" ]; then
+                # file is non-empty; assume to be valid SAM/BAM file
+                samtools index -@ {threads} "{input}"
+            else
+                # BAM file is empty
+                touch "{output}"
+            fi
+        }} &> "{log}"
+        '''
+
+# Generate summary statistics of individiual bam files
+rule generate_splitbam_statistics:
+    input:
+        SPLITBAMS + (SPLITBAMS_MERGED if merge_samples else [])
+    output:
+        SPLITBAMS_STATISTICS
+    log:
+        os.path.join(DIR_LOGS, "generate_splitbam_statistics.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        4
+    shell:
+        '''
+        {{
+            paths=({input:q})
+            for path in "${{paths[@]}}"; do
+                if [ -s "$path" ]; then
+                    # file is non-empty; assume to be valid SAM/BAM file
+                    count=$(samtools view -@ {threads} -c "$path")
+                else
+                    # file is empty
+                    count=0
+                fi
+                echo -e "${{path}}\\t${{count}}" >> "{output}"
+            done
+        }} &> "{log}"
+        '''
+
+rule generate_bigwigs:
+    input:
+        bam = os.path.join(DIR_OUT, "splitbams", "{file}.bam"),
+        index = os.path.join(DIR_OUT, "splitbams", "{file}.bam.bai"),
+    output:
+        os.path.join(DIR_OUT, "bigwigs", "{file}.bw")
+    log:
+        os.path.join(DIR_LOGS, "generate_bigwigs.{file}.log")
+    conda:
+        get_conda_env("envs/pipeline.yaml")
+    threads:
+        10
+    shell:
+        '''
+        {{
+            if [ ! -s "{input.bam}" ]; then
+                echo "BAM file is 0 bytes. Creating empty bigWig file."
+                touch "{output}"
+            else
+                n_reads=$(samtools view -c "{input.bam}")
+                if [ $n_reads -eq 0 ]; then
+                    echo "No reads in BAM file for target. Creating empty bigWig file."
+                    touch "{output}"
+                else
+                    bamCoverage \\
+                    --binSize "{binsize}" \\
+                    --normalizeUsing "{bigwig_normalization}" \\
+                    -p {threads} \\
+                    --bam "{input.bam}" \\
+                    --outFileName "{output}"
+                fi
+            fi
+        }} &> "{log}"
+        '''

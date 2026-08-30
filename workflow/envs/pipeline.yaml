@@ -1,0 +1,33 @@
+name: bead-barcoding-pipeline
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bedtools=2.31
+  - bowtie2=2.5.5
+  - coreutils>=8.31, <=8.32
+  - cutadapt=4.4
+  - deeptools=3.5.2
+  - fastqc=0.12.1
+  - fastqsplitter=1.2.0
+  - findutils>=4.6, <=4.8
+  - gawk=5.1.0
+  - grep>=3.6, <=3.11
+  - matplotlib=3.7.3
+  - multiqc=1.14
+  - numpy=1.23.5
+  - openjdk=8.0.412
+  - pandas=2.0.3
+  - pigz=2.6
+  - pysam=0.22.1
+  - python=3.10
+  - pyyaml=6.0
+  - samtools=1.21
+  - seaborn=0.12.2
+  - sed>=4.7, <=4.8
+  - setuptools<70
+  - splitcode=0.31.3
+  - star=2.7.11b
+  - tqdm=4.65
+  - trim-galore=0.6.10
+  - util-linux>=2.37.4, <=2.40
